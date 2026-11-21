@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { useTaskContext } from '../../context/TaskContext';
 import { User } from '../../types';
+import { VoiceAnnouncementControl } from '../alerts/VoiceAnnouncementControl';
 
 interface TopbarProps {
   currentUser: User | null;
@@ -182,6 +183,8 @@ export const Topbar: React.FC<TopbarProps> = ({
 
       {/* Right Controls */}
       <div className="flex items-center space-x-3">
+        <VoiceAnnouncementControl />
+
         {onRefresh && (
           <button
             onClick={onRefresh}

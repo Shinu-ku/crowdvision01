@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     ai_agent_timeout_seconds: float = 5.0
     ai_agent_enabled: bool = True
 
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = "tnSpp4vdxKPjI9w0GnoV"
+    elevenlabs_model_id: str = "eleven_flash_v2_5"
+    elevenlabs_output_format: str = "mp3_44100_128"
+    elevenlabs_enabled: bool = True
+    elevenlabs_timeout_seconds: float = 15.0
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
@@ -93,6 +100,12 @@ class Settings(BaseSettings):
     @property
     def images_dir(self) -> Path:
         p = self.base_dir / self.upload_dir / "images"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def announcements_dir(self) -> Path:
+        p = self.base_dir / self.upload_dir / "announcements"
         p.mkdir(parents=True, exist_ok=True)
         return p
 

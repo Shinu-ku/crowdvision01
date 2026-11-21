@@ -257,6 +257,21 @@ class ApiService {
     });
   }
 
+  // --- Alert Voice Announcements ---
+  async getAlertAnnouncement(alertId: string): Promise<any> {
+    return this.request(`/alerts/${alertId}/announcement`);
+  }
+
+  async acknowledgeAlertAnnouncementPlayed(alertId: string): Promise<any> {
+    return this.request(`/alerts/${alertId}/announcement/ack-played`, {
+      method: 'POST',
+    });
+  }
+
+  getAlertAudioUrl(alertId: string): string {
+    return `/api/alerts/${alertId}/announcement/audio`;
+  }
+
   // --- AI Chat ---
   async sendChatMessage(eventId: string, message: string): Promise<{
     event_id: string;

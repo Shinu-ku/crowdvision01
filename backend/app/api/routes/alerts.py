@@ -3,23 +3,28 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Optional
+import asyncio
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_access_token, security_scheme
-from app.database.models import Alert, User
+from app.database.models import Alert, AlertAnnouncement, User
 from app.database.session import get_db
 from app.schemas.api_schemas import (
     AlertAcknowledgeRequest,
+    AlertAnnouncementResponse,
     AlertCreateRequest,
     AlertResolveRequest,
     AlertResponse,
     AlertStatsResponse,
 )
+from app.services.announcement_coordinator import announcement_coordinator
 
 router = APIRouter()
 
@@ -133,6 +138,16 @@ async def create_alert(
     db.add(alert)
     await db.commit()
     await db.refresh(alert)
+
+    # Trigger ElevenLabs voice announcement for new alert asynchronously
+    asyncio.create_task(
+        announcement_coordinator.process_new_alert(
+            alert_id=alert.id,
+            alert_dict_or_obj=alert,
+            event_id=alert.event_id,
+        )
+    )
+
     return AlertResponse.model_validate(alert)
 
 
@@ -225,3 +240,54 @@ async def update_alert_status(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported status '{payload.status}'. Must be ACKNOWLEDGED or RESOLVED.",
         )
+
+
+@router.get("/{alert_id}/announcement", response_model=AlertAnnouncementResponse)
+async def get_alert_announcement(
+    alert_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Retrieve speech announcement status and metadata for a specific alert."""
+    stmt = select(AlertAnnouncement).where(AlertAnnouncement.alert_id == alert_id)
+    ann = (await db.execute(stmt)).scalar_one_or_none()
+    if not ann:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Announcement record not found for alert '{alert_id}'",
+        )
+    return AlertAnnouncementResponse.model_validate(ann)
+
+
+@router.get("/{alert_id}/announcement/audio")
+async def get_alert_announcement_audio(
+    alert_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Stream generated ElevenLabs speech audio file for an alert announcement."""
+    stmt = select(AlertAnnouncement).where(AlertAnnouncement.alert_id == alert_id)
+    ann = (await db.execute(stmt)).scalar_one_or_none()
+    if not ann or not ann.audio_file_path or not os.path.exists(ann.audio_file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Audio file not found or not yet generated for alert '{alert_id}'",
+        )
+    return FileResponse(
+        ann.audio_file_path,
+        media_type="audio/mpeg",
+        filename=f"announcement_{alert_id}.mp3",
+    )
+
+
+@router.post("/{alert_id}/announcement/ack-played")
+async def acknowledge_announcement_playback(
+    alert_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Acknowledge that frontend has completed audio playback for an alert announcement."""
+    success = await announcement_coordinator.acknowledge_playback(alert_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Announcement record not found for alert '{alert_id}'",
+        )
+    return {"status": "ok", "alert_id": alert_id, "played": True}
