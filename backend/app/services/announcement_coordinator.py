@@ -181,8 +181,9 @@ class AnnouncementCoordinator:
 
             if target_event_id:
                 await ws_manager.broadcast(target_event_id, payload)
-            # Also broadcast globally to ensure control room tabs receive high/critical alerts
-            await ws_manager.broadcast_all(payload)
+            else:
+                # Fallback to global broadcast if no specific event ID
+                await ws_manager.broadcast_all(payload)
             logger.info("Dispatched voice announcement to WebSocket clients", alert_id=alert_id, url=audio_rel_url)
 
         return announcement_record

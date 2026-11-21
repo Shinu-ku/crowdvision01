@@ -7,7 +7,8 @@
  * - Discards older alerts from the same zone for voice announcements.
  * - Preserves the first-seen zone arrival order when emitting announcements.
  * - Safeguards critical escalations by promptly dispatching when a zone transitions to CRITICAL.
- * - Dispatches selected alerts sequentially to VoiceAnnouncementQueue.
+ * - Dispatches selected alerts sequentially to SingleVoicePlaybackManager.
+ * - Tracks pendingAggregationIds as part of global alert lifecycle tracking.
  */
 
 import {
@@ -44,6 +45,7 @@ export class AlertBatchManager {
   private zoneHighestSeverityInBatch: Map<string, number> = new Map();
   private zoneHighestAnnouncedSeverity: Map<string, number> = new Map();
   private announcedAlertIds: Set<string> = new Set();
+  private pendingAggregationIds: Set<string> = new Set();
   private totalAlertsReceivedInBatch: number = 0;
   private listeners: Set<BatchStateListener> = new Set();
   private playbackQueue: typeof voiceAnnouncementQueue;
@@ -97,6 +99,10 @@ export class AlertBatchManager {
     };
   }
 
+  public getPendingAggregationIds(): Set<string> {
+    return new Set(this.pendingAggregationIds);
+  }
+
   /**
    * Derive a stable grouping key for the alert's zone.
    * Prefers zoneId; falls back to normalized zoneName; otherwise 'unknown_zone'.
@@ -131,7 +137,7 @@ export class AlertBatchManager {
       return false;
     }
 
-    // Deduplication check: drop if already announced in this session or in playback queue
+    // Deduplication check: drop if already announced or currently queued/playing
     if (
       this.announcedAlertIds.has(item.alertId) ||
       this.playbackQueue.isAlertAnnounced(item.alertId)
@@ -153,6 +159,13 @@ export class AlertBatchManager {
     }
 
     this.totalAlertsReceivedInBatch++;
+
+    // Track aggregation lifecycle ID: remove superseded ID if replacing existing zone item
+    const existingForZone = this.pendingByZone.get(zoneKey);
+    if (existingForZone) {
+      this.pendingAggregationIds.delete(existingForZone.alertId);
+    }
+    this.pendingAggregationIds.add(item.alertId);
 
     // Preserve initial arrival order of zones
     if (!this.zoneFirstSeenOrder.includes(zoneKey)) {
@@ -208,6 +221,7 @@ export class AlertBatchManager {
 
     // Reset current active collection batch
     this.pendingByZone.clear();
+    this.pendingAggregationIds.clear();
     this.zoneFirstSeenOrder = [];
     this.zoneHighestSeverityInBatch.clear();
     this.totalAlertsReceivedInBatch = 0;
@@ -241,6 +255,7 @@ export class AlertBatchManager {
     }
     this.windowStartTime = null;
     this.pendingByZone.clear();
+    this.pendingAggregationIds.clear();
     this.zoneFirstSeenOrder = [];
     this.zoneHighestSeverityInBatch.clear();
     this.totalAlertsReceivedInBatch = 0;

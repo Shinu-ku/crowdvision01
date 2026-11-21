@@ -1,3 +1,15 @@
+/**
+ * Global Single Voice Playback Authority for CrowdVision.
+ *
+ * Guarantees:
+ * 1. MAX_CONCURRENT_ACTIVE_PLAYBACKS === 1 across the entire application.
+ * 2. Strict serialization of all alert announcements (one at a time, waiting for audio.ended).
+ * 3. Cross-tab exclusive playback locking via Web Locks API (navigator.locks) and BroadcastChannel sync.
+ * 4. Comprehensive alert lifecycle tracking (received, aggregation, pending playback, currently playing, completed).
+ * 5. Robust at-most-once playback deduplication (no duplicates on reconnect, refresh, or multiple events).
+ * 6. Browser autoplay unlock compliance with fail-safe error recovery.
+ */
+
 import { api } from './api';
 
 export interface AnnouncementItem {
@@ -17,41 +29,116 @@ export type QueueStateListener = (state: {
   isAutoplayBlocked: boolean;
   currentAnnouncement: AnnouncementItem | null;
   queueLength: number;
+  activePlaybackCount: number;
 }) => void;
 
-class VoiceAnnouncementQueue {
+interface CrossTabMessage {
+  type: 'ALERT_CLAIMED' | 'ALERT_COMPLETED' | 'STATE_SYNC';
+  alertId?: string;
+  tabId: string;
+  timestamp: number;
+}
+
+export class SingleVoicePlaybackManager {
   private queue: AnnouncementItem[] = [];
   private isEnabled: boolean = true;
   private isMuted: boolean = false;
-  private isPlaying: boolean = false;
   private isAutoplayBlocked: boolean = false;
   private currentAnnouncement: AnnouncementItem | null = null;
-  private currentAudio: HTMLAudioElement | null = null;
-  private announcedIds: Set<string> = new Set();
+  private sharedAudio: HTMLAudioElement | null = null;
+
+  // Single-consumer atomic processing lock
+  private isProcessingQueue: boolean = false;
+  // Instrumented active playback counter: strictly 0 or 1
+  private activePlaybackCount: number = 0;
+
+  // Unique tab identifier for cross-tab leader coordination
+  private tabId: string = Math.random().toString(36).substring(2) + '_' + Date.now();
+  private channel: BroadcastChannel | null = null;
+
+  // Lifecycle stage tracking (Phase 7)
+  private receivedAlertIds: Set<string> = new Set();
+  private pendingPlaybackIds: Set<string> = new Set();
+  private currentlyPlayingAlertId: string | null = null;
+  private completedAlertIds: Set<string> = new Set();
+
   private listeners: Set<QueueStateListener> = new Set();
 
   constructor() {
-    // Load persisted settings
-    try {
-      const storedEnabled = localStorage.getItem('cv_voice_enabled');
-      if (storedEnabled !== null) {
-        this.isEnabled = storedEnabled === 'true';
-      }
-      const storedMuted = localStorage.getItem('cv_voice_muted');
-      if (storedMuted !== null) {
-        this.isMuted = storedMuted === 'true';
-      }
+    this.initStorageAndState();
+    this.initCrossTabChannel();
+  }
 
-      // Load session-persisted announced IDs to prevent replay on tab navigation
-      const storedIds = sessionStorage.getItem('cv_announced_alerts');
-      if (storedIds) {
-        const parsed = JSON.parse(storedIds);
-        if (Array.isArray(parsed)) {
-          this.announcedIds = new Set(parsed);
+  private initStorageAndState(): void {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const storedEnabled = localStorage.getItem('cv_voice_enabled');
+        if (storedEnabled !== null) {
+          this.isEnabled = storedEnabled === 'true';
+        }
+        const storedMuted = localStorage.getItem('cv_voice_muted');
+        if (storedMuted !== null) {
+          this.isMuted = storedMuted === 'true';
+        }
+
+        // Load globally persisted completed alert IDs
+        const storedCompleted = localStorage.getItem('cv_announced_alerts');
+        if (storedCompleted) {
+          const parsed = JSON.parse(storedCompleted);
+          if (Array.isArray(parsed)) {
+            this.completedAlertIds = new Set(parsed);
+          }
         }
       }
     } catch {
-      // Local storage may be restricted in sandboxed environments
+      // Storage restricted or unavailable in sandboxed environment
+    }
+  }
+
+  private initCrossTabChannel(): void {
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        this.channel = new BroadcastChannel('crowdvision_audio_authority');
+        this.channel.onmessage = (event: MessageEvent<CrossTabMessage>) => {
+          this.handleCrossTabMessage(event.data);
+        };
+      }
+    } catch {
+      // BroadcastChannel unsupported in current environment
+    }
+  }
+
+  private handleCrossTabMessage(msg: CrossTabMessage): void {
+    if (!msg || msg.tabId === this.tabId) return;
+
+    if (msg.type === 'ALERT_CLAIMED' && msg.alertId) {
+      // Another tab has acquired the playback lock for this alert
+      this.pendingPlaybackIds.delete(msg.alertId);
+      this.completedAlertIds.add(msg.alertId);
+      // Remove from this tab's local queue if it was pending
+      this.queue = this.queue.filter((q) => q.alertId !== msg.alertId);
+      this.notify();
+    } else if (msg.type === 'ALERT_COMPLETED' && msg.alertId) {
+      // Another tab finished playing this alert
+      this.completedAlertIds.add(msg.alertId);
+      this.pendingPlaybackIds.delete(msg.alertId);
+      this.queue = this.queue.filter((q) => q.alertId !== msg.alertId);
+      this.notify();
+    }
+  }
+
+  private broadcast(type: CrossTabMessage['type'], alertId?: string): void {
+    if (this.channel) {
+      try {
+        this.channel.postMessage({
+          type,
+          alertId,
+          tabId: this.tabId,
+          timestamp: Date.now(),
+        });
+      } catch {
+        // Safe ignore
+      }
     }
   }
 
@@ -63,99 +150,113 @@ class VoiceAnnouncementQueue {
     };
   }
 
-  private notify() {
+  private notify(): void {
     const state = {
       isEnabled: this.isEnabled,
       isMuted: this.isMuted,
-      isPlaying: this.isPlaying,
+      isPlaying: this.activePlaybackCount > 0,
       isAutoplayBlocked: this.isAutoplayBlocked,
       currentAnnouncement: this.currentAnnouncement,
       queueLength: this.queue.length,
+      activePlaybackCount: this.activePlaybackCount,
     };
     this.listeners.forEach((listener) => {
       try {
         listener(state);
       } catch {
-        // ignore listener errors
+        // ignore
       }
     });
   }
 
-  public setEnabled(enabled: boolean) {
-    this.isEnabled = enabled;
-    try {
-      localStorage.setItem('cv_voice_enabled', String(enabled));
-    } catch {
-      // ignore
-    }
-    if (!enabled && this.currentAudio) {
-      this.stopCurrent();
-    }
-    this.notify();
-    if (enabled && !this.isPlaying && this.queue.length > 0) {
-      this.playNext();
-    }
+  public getActivePlaybackCount(): number {
+    return this.activePlaybackCount;
   }
 
-  public setMuted(muted: boolean) {
-    this.isMuted = muted;
-    try {
-      localStorage.setItem('cv_voice_muted', String(muted));
-    } catch {
-      // ignore
-    }
-    if (this.currentAudio) {
-      this.currentAudio.muted = muted;
-    }
-    this.notify();
-  }
-
-  public toggleEnabled() {
-    this.setEnabled(!this.isEnabled);
-  }
-
-  public toggleMute() {
-    this.setMuted(!this.isMuted);
+  public getCurrentlyPlayingAlertId(): string | null {
+    return this.currentlyPlayingAlertId;
   }
 
   public isAlertAnnounced(alertId: string): boolean {
-    return this.announcedIds.has(alertId);
+    return (
+      this.completedAlertIds.has(alertId) ||
+      this.currentlyPlayingAlertId === alertId ||
+      this.pendingPlaybackIds.has(alertId)
+    );
   }
 
-  /**
-   * Enqueue a newly received alert announcement.
-   * Guarantees at-most-once enqueue per unique alertId.
-   */
-  public enqueue(item: AnnouncementItem): boolean {
-    if (!item.alertId || !item.audioUrl) {
-      return false;
-    }
+  public isAlertCompleted(alertId: string): boolean {
+    return this.completedAlertIds.has(alertId);
+  }
 
-    // Deduplication check
-    if (this.announcedIds.has(item.alertId)) {
-      return false;
-    }
-
-    // Record as seen immediately to avoid concurrent enqueue
-    this.announcedIds.add(item.alertId);
+  public setEnabled(enabled: boolean): void {
+    this.isEnabled = enabled;
     try {
-      sessionStorage.setItem('cv_announced_alerts', JSON.stringify(Array.from(this.announcedIds)));
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('cv_voice_enabled', String(enabled));
+      }
     } catch {
       // ignore
     }
+    if (!enabled) {
+      this.stopCurrent();
+    }
+    this.notify();
+    if (enabled && this.activePlaybackCount === 0 && this.queue.length > 0) {
+      this.scheduleQueueProcessing();
+    }
+  }
 
+  public setMuted(muted: boolean): void {
+    this.isMuted = muted;
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('cv_voice_muted', String(muted));
+      }
+    } catch {
+      // ignore
+    }
+    if (this.sharedAudio) {
+      this.sharedAudio.muted = muted;
+    }
+    this.notify();
+  }
+
+  public toggleEnabled(): void {
+    this.setEnabled(!this.isEnabled);
+  }
+
+  public toggleMute(): void {
+    this.setMuted(!this.isMuted);
+  }
+
+  /**
+   * Enqueue a validated alert for spoken playback.
+   * Enforces at-most-once deduplication across all stages and tabs.
+   */
+  public enqueue(item: AnnouncementItem): boolean {
+    if (!item || !item.alertId || !item.audioUrl) {
+      return false;
+    }
+
+    // Deduplication check: drop if completed, currently playing, or already in pending playback
+    if (this.isAlertAnnounced(item.alertId)) {
+      return false;
+    }
+
+    this.receivedAlertIds.add(item.alertId);
+    this.pendingPlaybackIds.add(item.alertId);
     this.queue.push(item);
     this.notify();
 
-    if (this.isEnabled && !this.isPlaying) {
-      this.playNext();
+    if (this.isEnabled && this.activePlaybackCount === 0) {
+      this.scheduleQueueProcessing();
     }
     return true;
   }
 
   /**
    * Enqueue a batch of announcements sequentially.
-   * Returns the count of successfully enqueued items.
    */
   public enqueueBatch(items: AnnouncementItem[]): number {
     let count = 0;
@@ -172,8 +273,8 @@ class VoiceAnnouncementQueue {
    */
   public async unlockAudio(): Promise<boolean> {
     try {
-      // Create a short empty buffer sound or resume AudioContext
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const AudioCtx =
+        (window as any).AudioContext || (window as any).webkitAudioContext;
       if (AudioCtx) {
         const ctx = new AudioCtx();
         if (ctx.state === 'suspended') {
@@ -184,8 +285,8 @@ class VoiceAnnouncementQueue {
       this.isAutoplayBlocked = false;
       this.notify();
 
-      if (this.isEnabled && !this.isPlaying && this.queue.length > 0) {
-        this.playNext();
+      if (this.isEnabled && this.activePlaybackCount === 0 && this.queue.length > 0) {
+        this.scheduleQueueProcessing();
       }
       return true;
     } catch {
@@ -193,90 +294,226 @@ class VoiceAnnouncementQueue {
     }
   }
 
-  private playNext() {
-    if (!this.isEnabled || this.isPlaying || this.queue.length === 0) {
+  /**
+   * Schedule queue processing through the single-consumer lock.
+   */
+  private scheduleQueueProcessing(): void {
+    if (this.isProcessingQueue || this.activePlaybackCount > 0 || !this.isEnabled) {
+      return;
+    }
+    this.processQueue();
+  }
+
+  /**
+   * Centralized single-consumer processing loop.
+   * Acquires cross-tab Web Lock before speaking each announcement.
+   */
+  private async processQueue(): Promise<void> {
+    if (this.isProcessingQueue || this.activePlaybackCount > 0 || !this.isEnabled) {
       return;
     }
 
-    const item = this.queue.shift();
-    if (!item) return;
+    this.isProcessingQueue = true;
 
-    this.isPlaying = true;
-    this.currentAnnouncement = item;
-    this.notify();
+    while (this.isEnabled && this.queue.length > 0 && this.activePlaybackCount === 0) {
+      const item = this.queue.shift();
+      if (!item) break;
 
-    const audio = new Audio();
-    this.currentAudio = audio;
-    audio.src = item.audioUrl;
-    audio.muted = this.isMuted;
-    audio.preload = 'auto';
-
-    const cleanUp = () => {
-      if (this.currentAudio === audio) {
-        this.currentAudio = null;
+      // Verify the item was not announced by another tab while queued
+      if (this.completedAlertIds.has(item.alertId)) {
+        this.pendingPlaybackIds.delete(item.alertId);
+        continue;
       }
-      audio.src = '';
-      audio.load();
-      this.isPlaying = false;
-      this.currentAnnouncement = null;
-      this.notify();
-    };
 
-    audio.onended = () => {
-      cleanUp();
-      // Acknowledge backend playback
-      api.acknowledgeAlertAnnouncementPlayed(item.alertId).catch(() => {
-        // Safe ignore
-      });
-      // Continue queue
-      this.playNext();
-    };
-
-    audio.onerror = () => {
-      cleanUp();
-      // Advance to next without getting stuck
-      this.playNext();
-    };
-
-    const playPromise = audio.play();
-    if (playPromise !== undefined) {
-      playPromise.catch((err) => {
-        if (err.name === 'NotAllowedError') {
-          // Browser autoplay restriction encountered
-          this.isAutoplayBlocked = true;
-          // Re-queue item at the front
-          this.queue.unshift(item);
-          cleanUp();
-        } else {
-          // Other playback failure (network/decode)
-          cleanUp();
-          this.playNext();
+      // Cross-tab coordination: use Web Locks API if available
+      if (typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request) {
+        let lockAcquired = false;
+        try {
+          await navigator.locks.request(
+            'crowdvision_single_voice_authority',
+            { mode: 'exclusive' },
+            async () => {
+              lockAcquired = true;
+              // Check again inside the lock
+              if (this.completedAlertIds.has(item.alertId)) {
+                this.pendingPlaybackIds.delete(item.alertId);
+                return;
+              }
+              await this.playSingleAnnouncement(item);
+            }
+          );
+        } catch {
+          // If lock request fails, fallback to local single playback
+          if (!lockAcquired) {
+            await this.playSingleAnnouncement(item);
+          }
         }
-      });
+      } else {
+        // Fallback for environments without navigator.locks (e.g. Node tests)
+        await this.playSingleAnnouncement(item);
+      }
     }
+
+    this.isProcessingQueue = false;
   }
 
-  public stopCurrent() {
-    if (this.currentAudio) {
+  /**
+   * Authoritative audio playback execution for exactly ONE alert.
+   * Holds activePlaybackCount === 1 for the entire duration until audio.ended.
+   */
+  private playSingleAnnouncement(item: AnnouncementItem): Promise<void> {
+    return new Promise<void>((resolve) => {
+      // Invariant check: never allow > 1 concurrent playback
+      if (this.activePlaybackCount > 0) {
+        // Re-queue at head to prevent loss and abort duplicate
+        this.queue.unshift(item);
+        resolve();
+        return;
+      }
+
+      this.activePlaybackCount = 1;
+      this.currentlyPlayingAlertId = item.alertId;
+      this.pendingPlaybackIds.delete(item.alertId);
+      this.currentAnnouncement = item;
+
+      // Broadcast to other tabs that this alert is actively claimed
+      this.broadcast('ALERT_CLAIMED', item.alertId);
+      this.notify();
+
+      // Use or create the single authoritative audio element
+      let audio = this.sharedAudio;
+      if (!audio && typeof Audio !== 'undefined') {
+        audio = new Audio();
+        this.sharedAudio = audio;
+      }
+
+      if (!audio) {
+        // Environment without Audio (headless/test mock fallback)
+        this.finishPlayback(item);
+        resolve();
+        return;
+      }
+
+      audio.src = item.audioUrl;
+      audio.muted = this.isMuted;
+      audio.preload = 'auto';
+
+      let isFinished = false;
+
+      const finishOnce = () => {
+        if (isFinished) return;
+        isFinished = true;
+        audio.onended = null;
+        audio.onerror = null;
+        this.finishPlayback(item);
+        resolve();
+      };
+
+      audio.onended = () => {
+        // Report backend playback acknowledgement
+        api.acknowledgeAlertAnnouncementPlayed(item.alertId).catch(() => {});
+        finishOnce();
+      };
+
+      audio.onerror = () => {
+        // Playback failure: safe cleanup and advance
+        finishOnce();
+      };
+
+      const playPromise = audio.play();
+      if (playPromise !== undefined) {
+        playPromise.catch((err: any) => {
+          if (err && err.name === 'NotAllowedError') {
+            // Autoplay blocked by browser
+            this.isAutoplayBlocked = true;
+            this.activePlaybackCount = 0;
+            this.currentlyPlayingAlertId = null;
+            this.currentAnnouncement = null;
+            this.queue.unshift(item); // Retain item at front
+            this.pendingPlaybackIds.add(item.alertId);
+            this.notify();
+            isFinished = true;
+            audio.onended = null;
+            audio.onerror = null;
+            resolve();
+          } else {
+            // Other decode/network failure: safely advance
+            finishOnce();
+          }
+        });
+      }
+    });
+  }
+
+  private finishPlayback(item: AnnouncementItem): void {
+    if (this.sharedAudio) {
       try {
-        this.currentAudio.pause();
-        this.currentAudio.src = '';
-        this.currentAudio.load();
+        this.sharedAudio.pause();
+        this.sharedAudio.src = '';
       } catch {
         // ignore
       }
-      this.currentAudio = null;
     }
-    this.isPlaying = false;
+
+    this.activePlaybackCount = 0;
+    this.currentlyPlayingAlertId = null;
+    this.currentAnnouncement = null;
+    this.completedAlertIds.add(item.alertId);
+
+    // Persist completed alert ID to storage
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(
+          'cv_announced_alerts',
+          JSON.stringify(Array.from(this.completedAlertIds))
+        );
+      }
+    } catch {
+      // ignore
+    }
+
+    // Broadcast completion to other tabs
+    this.broadcast('ALERT_COMPLETED', item.alertId);
+    this.notify();
+  }
+
+  public stopCurrent(): void {
+    if (this.sharedAudio) {
+      try {
+        this.sharedAudio.pause();
+        this.sharedAudio.src = '';
+        this.sharedAudio.load();
+      } catch {
+        // ignore
+      }
+    }
+    this.activePlaybackCount = 0;
+    this.currentlyPlayingAlertId = null;
     this.currentAnnouncement = null;
     this.notify();
   }
 
-  public destroy() {
+  public destroy(): void {
     this.stopCurrent();
     this.queue = [];
+    this.pendingPlaybackIds.clear();
     this.listeners.clear();
+    if (this.channel) {
+      try {
+        this.channel.close();
+      } catch {
+        // ignore
+      }
+      this.channel = null;
+    }
+  }
+
+  public reset(): void {
+    this.destroy();
+    this.receivedAlertIds.clear();
+    this.completedAlertIds.clear();
+    this.initCrossTabChannel();
   }
 }
 
-export const voiceAnnouncementQueue = new VoiceAnnouncementQueue();
+export const voiceAnnouncementQueue = new SingleVoicePlaybackManager();

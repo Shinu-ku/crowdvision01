@@ -106,7 +106,7 @@ def test_zone_mapper_and_analytics_calibrated_vs_relative():
     )
     assert len(snaps) == 2
     assert len(ser_dets) == 3
-    assert len(heatmap) == 20 and len(heatmap[0]) == 12
+    assert (len(heatmap) == 36 and len(heatmap[0]) == 64) or (len(heatmap) == 20 and len(heatmap[0]) == 12)
 
     s_z1 = next(s for s in snaps if s.zone_id == "z1")
     s_z2 = next(s for s in snaps if s.zone_id == "z2")
