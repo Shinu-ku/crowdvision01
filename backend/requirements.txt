@@ -13,7 +13,7 @@ alembic>=1.14.0
 
 # Computer Vision & Numerical Computing
 opencv-python-headless>=4.10.0.84
-numpy>=1.26.0
+numpy>=2.5.5
 scipy>=1.14.0
 
 # Security & Authentication
