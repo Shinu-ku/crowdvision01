@@ -44,6 +44,7 @@ from app.integrations.agent_client import AIAgentClient
 from app.prediction.engine import PredictionEngine
 from app.risk.alert_service import AlertService
 from app.risk.engine import RiskEngine
+from app.services.announcement_coordinator import announcement_coordinator
 from app.services.ws_manager import ws_manager
 
 logger = get_logger("services.video_processor")
@@ -407,6 +408,7 @@ class VideoProcessor:
                         session.add(risk_record)
 
                     # Alerts
+                    created_alert_records: list[Alert] = []
                     for a in new_alerts:
                         z_id = a.get("zone_id") if isinstance(a, dict) else getattr(a, "zone_id", None)
                         z_name = a.get("zone_name") if isinstance(a, dict) else getattr(a, "zone_name", "")
@@ -429,6 +431,7 @@ class VideoProcessor:
                             source="RISK_ENGINE",
                         )
                         session.add(alert_record)
+                        created_alert_records.append(alert_record)
 
                     # Update job progress
                     await session.execute(
@@ -444,6 +447,16 @@ class VideoProcessor:
                         )
                     )
                     await session.commit()
+
+                    # Trigger ElevenLabs voice announcements for newly committed alerts
+                    for rec in created_alert_records:
+                        asyncio.create_task(
+                            announcement_coordinator.process_new_alert(
+                                alert_id=rec.id,
+                                alert_dict_or_obj=rec,
+                                event_id=event_id,
+                            )
+                        )
 
                 # Live WebSocket Broadcast
                 ws_payload = {
@@ -503,6 +516,21 @@ class VideoProcessor:
                         for r in risk_assessments
                     ],
                     "alerts": [
+                        {
+                            "id": rec.id,
+                            "event_id": rec.event_id,
+                            "zone_id": rec.zone_id,
+                            "zone_name": rec.zone_name,
+                            "category": rec.category,
+                            "severity": rec.severity,
+                            "title": rec.title,
+                            "description": rec.description,
+                            "supporting_measurements": rec.supporting_measurements,
+                            "status": rec.status,
+                            "video_timestamp_sec": rec.video_timestamp_sec,
+                        }
+                        for rec in created_alert_records
+                    ] if created_alert_records else [
                         asdict(a) if is_dataclass(a) else (a if isinstance(a, dict) else a.__dict__)
                         for a in new_alerts
                     ],

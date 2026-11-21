@@ -59,6 +59,8 @@ backend/uploads/images/*
 !backend/uploads/images/.gitkeep
 backend/uploads/floorplans/*
 !backend/uploads/floorplans/.gitkeep
+backend/uploads/announcements/*
+!backend/uploads/announcements/.gitkeep
 backend/uploads/processed/*
 !backend/uploads/processed/.gitkeep
 *.mp4

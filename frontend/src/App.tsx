@@ -22,6 +22,8 @@ import {
 } from './types';
 import { api } from './services/api';
 import { wsClient } from './services/websocket';
+import { voiceAnnouncementQueue } from './services/voiceAnnouncementQueue';
+import { alertBatchManager } from './services/alertBatchManager';
 
 const AppInner: React.FC = () => {
   const { activeTask, refreshTasks } = useTaskContext();
@@ -80,8 +82,24 @@ const AppInner: React.FC = () => {
     // Connect WebSocket for live telemetry
     wsClient.connect(activeTask.id);
     const unsubscribe = wsClient.subscribe((data) => {
+      // Ingest live alert announcements through the 17-second Zone Batching Manager
+      if (data.type === 'ALERT_ANNOUNCEMENT' && data.alert_id && data.audio_url) {
+        alertBatchManager.addAlert({
+          alertId: data.alert_id,
+          audioUrl: data.audio_url,
+          spokenText: data.spoken_text || '',
+          severity: data.severity,
+          zoneId: data.zone_id,
+          zoneName: data.zone_name,
+        });
+      }
+
       if (data.alerts && data.alerts.length > 0) {
-        setAlerts((prev) => [...data.alerts, ...prev]);
+        setAlerts((prev) => {
+          const existingIds = new Set(prev.map((a) => a.id));
+          const fresh = data.alerts.filter((a: any) => !a.id || !existingIds.has(a.id));
+          return [...fresh, ...prev];
+        });
       }
     });
 

@@ -11,6 +11,7 @@ import {
 import { AlertItem, AlertSeverity } from '../../types';
 import { RiskPill } from '../common/RiskPill';
 import { api } from '../../services/api';
+import { VoiceAnnouncementControl } from './VoiceAnnouncementControl';
 
 interface AlertsPanelProps {
   alerts: AlertItem[];
@@ -55,8 +56,11 @@ export const AlertsPanel: React.FC<AlertsPanelProps> = ({
           </p>
         </div>
 
-        {/* Severity Filter Pills */}
-        <div className="flex items-center space-x-1.5 p-1 rounded-lg bg-[#070B14] border border-slate-800 text-xs font-mono">
+        <div className="flex items-center space-x-3">
+          <VoiceAnnouncementControl compact />
+
+          {/* Severity Filter Pills */}
+          <div className="flex items-center space-x-1.5 p-1 rounded-lg bg-[#070B14] border border-slate-800 text-xs font-mono">
           {['ALL', 'CRITICAL', 'HIGH', 'MEDIUM'].map((sev) => (
             <button
               key={sev}
@@ -70,6 +74,7 @@ export const AlertsPanel: React.FC<AlertsPanelProps> = ({
               {sev}
             </button>
           ))}
+          </div>
         </div>
       </div>
 

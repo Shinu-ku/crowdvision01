@@ -337,6 +337,28 @@ class Alert(Base):
     source: Mapped[str] = mapped_column(String(64), default="RISK_ENGINE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+    announcement: Mapped[Optional["AlertAnnouncement"]] = relationship("AlertAnnouncement", back_populates="alert", uselist=False, cascade="all, delete-orphan")
+
+
+class AlertAnnouncement(Base):
+    __tablename__ = "alert_announcements"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    alert_id: Mapped[str] = mapped_column(String(36), ForeignKey("alerts.id", ondelete="CASCADE"), unique=True, index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)  # pending, generating, audio_ready, played, failed
+    spoken_text: Mapped[str] = mapped_column(Text, nullable=False)
+    audio_file_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    audio_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    voice_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    model_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    play_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    played_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    alert: Mapped["Alert"] = relationship("Alert", back_populates="announcement")
+
 
 
 
